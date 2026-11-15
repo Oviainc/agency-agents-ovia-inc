@@ -160,7 +160,8 @@ export class DOMSnapshotSerializer {
     const dangerousTags = clone.querySelectorAll('script, iframe, object, embed, applet');
     dangerousTags.forEach((el) => el.remove());
 
-    const allElements = clone.querySelectorAll('*');
+    // querySelectorAll('*') excludes the root itself.
+    const allElements = [clone, ...Array.from(clone.querySelectorAll('*'))];
     allElements.forEach((el) => {
       Array.from(el.attributes).forEach((attr) => {
         if (attr.name.toLowerCase().startsWith('on')) {
@@ -277,22 +278,32 @@ export class PageGeometryEngine {
   };
 
   public static getDimensions(format: PageFormat, custom?: CustomPageDimensions) {
-    const dim = format === 'custom' && custom ? custom : this.PRESETS[format as keyof typeof this.PRESETS] || this.PRESETS.a4;
-    const widthPt = (dim.widthMm * 72) / 25.4;
-    const heightPt = (dim.heightMm * 72) / 25.4;
-    const widthPx = (dim.widthMm * 96) / 25.4;
-    const heightPx = (dim.heightMm * 96) / 25.4;
+    const dim = format === 'custom' ? custom : this.PRESETS[format as keyof typeof this.PRESETS];
+    if (!dim || !Number.isFinite(dim.widthMm) || !Number.isFinite(dim.heightMm) ||
+        dim.widthMm <= 0 || dim.heightMm <= 0) {
+      throw new Error('A supported format or finite positive custom page dimensions are required.');
+    }
+    const widthPt = Number(((dim.widthMm * 72) / 25.4).toFixed(2));
+    const heightPt = Number(((dim.heightMm * 72) / 25.4).toFixed(2));
+    const widthPx = Number(((dim.widthMm * 96) / 25.4).toFixed(2));
+    const heightPx = Number(((dim.heightMm * 96) / 25.4).toFixed(2));
+    const heightBudgetPx = Number(((dim.heightMm * 96) / 25.4 - 0.5).toFixed(2));
+    if (![widthPt, heightPt, widthPx, heightPx].every(Number.isFinite) ||
+        widthPt <= 0 || heightPt <= 0 || widthPx <= 0 || heightPx <= 0 ||
+        heightBudgetPx <= 0) {
+      throw new Error('Page geometry must leave a positive finite layout budget.');
+    }
 
     return {
       name: dim.name || 'Custom',
       widthMm: dim.widthMm,
       heightMm: dim.heightMm,
-      widthPt: Number(widthPt.toFixed(2)),
-      heightPt: Number(heightPt.toFixed(2)),
-      widthPx: Number(widthPx.toFixed(2)),
-      heightPx: Number(heightPx.toFixed(2)),
+      widthPt,
+      heightPt,
+      widthPx,
+      heightPx,
       // Epsilon-buffered maximum height to prevent LayoutUnit quantization blank pages
-      heightBudgetPx: Number((heightPx - 0.5).toFixed(2))
+      heightBudgetPx
     };
   }
 
@@ -333,104 +344,138 @@ export class PageGeometryEngine {
 Maintains a warm Chromium browser instance with pooled, isolated `BrowserContext` objects, concurrency rate limiting, route blocking for external noise, and scheduled recycling to deliver sub-80ms compilations:
 
 ```python
-# cv_pdf_pool.py: High-Throughput Browser Context Pool
+# cv_pdf_pool.py: Drain active jobs before recycling the shared browser.
 import asyncio
 import logging
 from typing import Optional
-from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
+from playwright.async_api import async_playwright, Browser, Playwright
 
 logger = logging.getLogger("pdf_pool")
 
 class PlaywrightPDFPool:
     def __init__(self, max_concurrency: int = 4, max_jobs_before_recycle: int = 500):
-        self.max_concurrency = max_concurrency
+        if max_concurrency < 1 or max_jobs_before_recycle < 1:
+            raise ValueError("Pool limits must be positive")
         self.max_jobs_before_recycle = max_jobs_before_recycle
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.job_counter = 0
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
-        self._lock = asyncio.Lock()
+        self._condition = asyncio.Condition()
+        self._active_jobs = 0
+        self._recycling = False
+        self._closed = False
+        self._shutdown_task = None
 
-    async def initialize(self):
-        async with self._lock:
-            if self.browser and self.browser.is_connected():
-                return
-            self.playwright = await async_playwright().start()
+    async def _close_locked(self):
+        browser, playwright = self.browser, self.playwright
+        self.browser = self.playwright = None
+        try:
+            if browser:
+                await browser.close()
+        finally:
+            if playwright:
+                await playwright.stop()
+
+    async def _initialize_locked(self):
+        if self.browser and self.browser.is_connected():
+            return
+        if self._active_jobs:
+            raise RuntimeError("Disconnected browser still has active jobs")
+        await self._close_locked()
+        self.playwright = await async_playwright().start()
+        try:
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
-                args=[
-                    "--disable-background-networking",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--font-render-hinting=none"
-                ]
+                args=["--disable-background-networking", "--disable-gpu",
+                      "--disable-dev-shm-usage", "--no-sandbox", "--font-render-hinting=none"]
             )
-            self.job_counter = 0
-            logger.info("Playwright PDF Pool initialized with warm Chromium instance.")
+        except BaseException:
+            await self._close_locked()
+            raise
+        self.job_counter = 0
 
-    async def render_pdf(
-        self,
-        html_content: str,
-        width_mm: float = 210.0,
-        height_mm: float = 297.0
-    ) -> bytes:
-        await self.initialize()
+    async def initialize(self):
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._recycling or self._closed)
+            if self._closed:
+                raise RuntimeError("PDF pool is shut down")
+            await self._initialize_locked()
 
+    async def render_pdf(self, html_content: str, width_mm: float = 210.0,
+                         height_mm: float = 297.0) -> bytes:
         async with self.semaphore:
-            self.job_counter += 1
-            if self.job_counter >= self.max_jobs_before_recycle:
-                logger.info("Recycling browser process after %d jobs.", self.job_counter)
-                await self.recycle()
+            async with self._condition:
+                # At the threshold, stop admitting new jobs until this
+                # generation drains; sustained traffic cannot starve recycling.
+                await self._condition.wait_for(lambda: self._closed or (
+                    not self._recycling and (self.job_counter < self.max_jobs_before_recycle
+                                            or self._active_jobs == 0)
+                ))
+                if self._closed:
+                    raise RuntimeError("PDF pool is shut down")
+                # Drain at the configured threshold without interrupting active
+                # renders or reacquiring a lock held by the same coroutine.
+                if self._active_jobs == 0 and self.job_counter >= self.max_jobs_before_recycle:
+                    await self._close_locked()
+                await self._initialize_locked()
+                browser = self.browser
+                self._active_jobs += 1
+                self.job_counter += 1
 
-            # Create isolated context for the request
-            context: BrowserContext = await self.browser.new_context(
-                viewport={"width": int(width_mm * 96 / 25.4), "height": int(height_mm * 96 / 25.4)},
-                device_scale_factor=1.0
-            )
-
+            context = None
             try:
-                page = await context.new_page()
-
-                # Abort tracking and off-target external requests
-                await page.route(
-                    "**/*",
-                    lambda route: route.abort() if route.request.resource_type in ["media", "websocket"] else route.continue_()
+                context = await browser.new_context(
+                    viewport={"width": int(width_mm * 96 / 25.4), "height": int(height_mm * 96 / 25.4)},
+                    device_scale_factor=1.0
                 )
-
-                # Load HTML with networkidle guarantee
+                page = await context.new_page()
+                await page.route("**/*", lambda route: route.abort()
+                                 if route.request.resource_type in ["media", "websocket"]
+                                 else route.continue_())
                 await page.set_content(html_content, wait_until="networkidle")
                 await page.evaluate("document.fonts.ready")
-
-                # Generate tagged, vector-clean PDF via CDP
-                pdf_bytes = await page.pdf(
-                    width=f"{width_mm}mm",
-                    height=f"{height_mm}mm",
-                    print_background=True,
-                    prefer_css_page_size=True,
-                    tagged=True,
+                return await page.pdf(
+                    width=f"{width_mm}mm", height=f"{height_mm}mm",
+                    print_background=True, prefer_css_page_size=True, tagged=True,
                     margin={"top": "0mm", "right": "0mm", "bottom": "0mm", "left": "0mm"}
                 )
-                return pdf_bytes
             finally:
-                await context.close()
+                try:
+                    if context:
+                        await context.close()
+                finally:
+                    async with self._condition:
+                        self._active_jobs -= 1
+                        self._condition.notify_all()
 
     async def recycle(self):
-        async with self._lock:
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
-            self.browser = None
-            self.playwright = None
-            await self.initialize()
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._recycling or self._closed)
+            if self._closed:
+                raise RuntimeError("PDF pool is shut down")
+            self._recycling = True
+            try:
+                await self._condition.wait_for(lambda: self._active_jobs == 0)
+                await self._close_locked()
+                await self._initialize_locked()
+            finally:
+                self._recycling = False
+                self._condition.notify_all()
+
+    async def _finish_shutdown(self):
+        async with self._condition:
+            self._condition.notify_all()
+            await self._condition.wait_for(lambda: self._active_jobs == 0 and not self._recycling)
+            await self._close_locked()
 
     async def shutdown(self):
-        async with self._lock:
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
+        # Retain cleanup: cancelling a caller must not abandon the browser
+        # after in-flight renders finish.
+        self._closed = True
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(self._finish_shutdown())
+        await asyncio.shield(self._shutdown_task)
 ```
 
 ### 4. 1:1 Sheet Canvas Viewport Scaler Architecture (CSS & React)
@@ -529,12 +574,13 @@ export const CVPageViewportScaler: React.FC<ScalerProps> = ({
 
 ### 5. Accessible Tagged PDF & PDF/A-2b Post-Processing Pipeline (`pikepdf` Python)
 
-Applies non-destructive metadata post-processing using `pikepdf` to attach PDF/A-2b and PDF/UA-1 XMP metadata packets, enforce sRGB Output Intent, and linearize for instant web streaming:
+Requires `pikepdf[pdfa] >= 10.14`. Update descriptive metadata, install a real sRGB output intent and return bytes only after the PDF/A-2b save validator accepts the written document. Metadata declarations alone do not establish conformance; this helper does not establish or declare PDF/UA-1 compliance.
 
 ```python
 # pdf_post_processor.py
 import io
 import pikepdf
+from pikepdf import pdfa
 
 def post_process_pdf_a2b(
     pdf_bytes: bytes,
@@ -542,38 +588,22 @@ def post_process_pdf_a2b(
     author: str = "System",
     subject: str = "Standard Report"
 ) -> bytes:
-    """Post-process a Chromium tagged PDF into compliant PDF/A-2b and PDF/UA-1."""
-    pdf = pikepdf.open(io.BytesIO(pdf_bytes))
+    """Return a validated PDF/A-2b candidate, or raise pdfa.PdfaError."""
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        with pdf.open_metadata() as meta:
+            meta["dc:title"] = title
+            meta["dc:creator"] = [author]
+            meta["dc:description"] = subject
 
-    # 1. Update Document Info Dictionary
-    with pdf.open_metadata() as meta:
-        meta["dc:title"] = title
-        meta["dc:creator"] = [author]
-        meta["dc:description"] = subject
-        meta["pdfaid:part"] = "2"
-        meta["pdfaid:conformance"] = "B"
-        meta["pdfuaid:part"] = "1"
-
-    # 2. Attach sRGB Output Intent if not present
-    if "/OutputIntents" not in pdf.Root:
-        icc_profile_data = b"..." # Embed standard sRGB2014 ICC profile stream
-        icc_stream = pdf.make_stream(icc_profile_data)
-        icc_stream["/N"] = 3
-
-        output_intent = pdf.make_indirect({
-            "/Type": pikepdf.Name("/OutputIntent"),
-            "/S": pikepdf.Name("/GTS_PDFA1"),
-            "/OutputConditionIdentifier": pikepdf.String("sRGB IEC61966-2.1"),
-            "/Info": pikepdf.String("sRGB IEC61966-2.1"),
-            "/DestOutputProfile": icc_stream
-        })
-        pdf.Root["/OutputIntents"] = pdf.make_array([output_intent])
-
-    # 3. Save linearized (Fast Web View)
-    out_buf = io.BytesIO()
-    pdf.save(out_buf, linearize=True)
-    return out_buf.getvalue()
+        out_buf = io.BytesIO()
+        # save supplies a valid built-in ICC profile, prepares metadata,
+        # reopens the written bytes and rejects violations or unchecked constructs.
+        # It does not embed missing fonts or convert page colours/content.
+        pdfa.save(pdf, out_buf, "2b", output_intent="sRGB", linearize=True)
+        return out_buf.getvalue()
 ```
+
+Handle `pdfa.PdfaError` as a failed export gate, preserving its report for remediation. Fix unsupported content with an appropriate converter rather than stamping conformance identifiers onto it. Use [veraPDF](https://verapdf.org/) for authoritative PDF/A validation and a separate PDF/UA validation workflow before making accessibility claims. See [pikepdf's validation and repair contract](https://pikepdf.readthedocs.io/en/latest/topics/pdfa.html).
 
 ### 6. Automated PDF Vector & Text Integrity Auditor (Python)
 
@@ -640,7 +670,7 @@ class PDFVectorIntegrityAuditor:
    - Wait for `document.fonts.ready`.
    - Invoke `page.pdf({ width, height, preferCSSPageSize: true, printBackground: true, tagged: true })`.
 5. **Step 5: Metadata Post-Processing & Audit Gate**:
-   - Pass raw PDF through `pikepdf` to attach PDF/A-2b and PDF/UA-1 XMP metadata packets.
+   - Pass raw PDF through the validated PDF/A-2b save gate; remediate failures and independently validate PDF/UA accessibility before claiming it.
    - Execute `PDFVectorIntegrityAuditor` to confirm vector text operators and verify zero rasterization fallbacks.
 
 ## 💭 Your Communication Style
